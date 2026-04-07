@@ -62,6 +62,11 @@ type ControllerHelper interface {
 	// event message in a manner appropriate to the container orchestrator.
 	RecordVolumeEvent(ctx context.Context, name, eventType, reason, message string)
 
+	// PatchVolumeAnnotations merges the supplied annotations into the PVC identified
+	// by the given CSI volume name (pvc-<uid>). Existing annotations are preserved;
+	// only the supplied keys are added or overwritten.
+	PatchVolumeAnnotations(ctx context.Context, name string, annotations map[string]string) error
+
 	// RecordNodeEvent accepts the name of a CSI node and writes the specified
 	// event message in a manner appropriate to the container orchestrator.
 	RecordNodeEvent(ctx context.Context, name, eventType, reason, message string)

@@ -151,6 +151,11 @@ func (h *helper) RecordVolumeEvent(ctx context.Context, name, eventType, reason,
 	}).Trace("Volume event.")
 }
 
+// PatchVolumeAnnotations is a no-op in plain CSI mode (no Kubernetes API).
+func (h *helper) PatchVolumeAnnotations(_ context.Context, _ string, _ map[string]string) error {
+	return nil
+}
+
 // RecordNodeEvent accepts the name of a CSI node and writes the specified
 // event message to the debug Log().
 func (h *helper) RecordNodeEvent(ctx context.Context, name, eventType, reason, message string) {
