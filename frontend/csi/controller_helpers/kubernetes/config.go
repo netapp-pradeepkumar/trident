@@ -81,6 +81,19 @@ const (
 	AnnTieringPolicy             = prefix + "/tieringPolicy"
 	AnnTieringMinimumCoolingDays = prefix + "/tieringMinimumCoolingDays"
 
+	// Shift/MTV StorageClass annotations
+	AnnShiftStorageClassType   = "shift.netapp.io/storage-class-type"
+	AnnShiftTridentBackendUUID = "shift.netapp.io/trident-backend-uuid"
+
+	// Shift API credential secret (lives in the Shift service namespace)
+	ShiftCredentialSecretName      = "shift-credentials"
+	ShiftCredentialSecretNamespace = "shift"
+
+	// MTV PVC annotations
+	AnnMTVDiskSource  = "forklift.konveyor.io/disk-source"
+	AnnMTVNFSServer = "forklift.konveyor.io/nfs-server"
+	AnnMTVNFSPath   = "forklift.konveyor.io/nfs-path"
+
 	// Pod remediation policy annotation and values
 	AnnPodRemediationPolicyAnnotation = prefix + "/podRemediationPolicy"
 	PodRemediationPolicyDelete        = "delete"

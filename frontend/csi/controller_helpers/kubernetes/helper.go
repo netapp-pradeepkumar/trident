@@ -4,6 +4,7 @@ package kubernetes
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 
 	"github.com/netapp/trident/config"
 	frontendcommon "github.com/netapp/trident/frontend/common"
@@ -98,6 +100,34 @@ func (h *helper) GetVolumeConfig(
 	scAnnotations := processSCAnnotations(sc)
 
 	volumeConfig := getVolumeConfig(ctx, pvc, pvName, pvcSize, annotations, sc, requisiteTopology, preferredTopology)
+
+	// Detect Shift StorageClass and populate ShiftConfig with ONTAP credentials + MTV metadata
+	if scAnnotations[AnnShiftStorageClassType] == "shift" {
+		Logc(ctx).WithFields(LogFields{
+			"storageClass": sc.Name,
+			"pvc":          pvc.Name,
+		}).Info("Shift StorageClass detected, building Shift config.")
+
+		shiftCfg, shiftErr := h.buildShiftConfig(ctx, pvc, scAnnotations)
+		if shiftErr != nil {
+			Logc(ctx).WithFields(LogFields{
+				"pvc":          pvc.Name,
+				"storageClass": sc.Name,
+				"error":        shiftErr,
+			}).Error("Failed to build Shift config.")
+			return nil, shiftErr
+		}
+		volumeConfig.Shift = shiftCfg
+
+		Logc(ctx).WithFields(LogFields{
+			"backendUUID":   shiftCfg.BackendUUID,
+			"managementLIF": shiftCfg.ManagementLIF,
+			"svm":           shiftCfg.SVM,
+			"diskPath":      shiftCfg.DiskPath,
+			"nfsServer":     shiftCfg.NFSServer,
+			"nfsPath":       shiftCfg.NFSPath,
+		}).Info("Shift config successfully populated on VolumeConfig.")
+	}
 
 	// Update the volume config with the Access Control only if the storage class nasType parameter is SMB
 	if sc.Parameters[SCParameterNASType] == NASTypeSMB {
@@ -753,6 +783,42 @@ func (h *helper) RecordVolumeEvent(ctx context.Context, name, eventType, reason,
 	}
 }
 
+// PatchVolumeAnnotations merges the supplied annotations into the PVC identified by the
+// given CSI volume name (pvc-<uid>). Existing annotations are preserved; only the supplied
+// keys are added or overwritten.
+func (h *helper) PatchVolumeAnnotations(
+	ctx context.Context, name string, annotations map[string]string,
+) error {
+	pvc, err := h.getPVCForCSIVolume(ctx, name)
+	if err != nil {
+		return fmt.Errorf("failed to find PVC for volume %s: %v", name, err)
+	}
+
+	patch := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": annotations,
+		},
+	}
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("failed to marshal annotation patch: %v", err)
+	}
+
+	_, err = h.kubeClient.CoreV1().PersistentVolumeClaims(pvc.Namespace).Patch(
+		ctx, pvc.Name, k8stypes.MergePatchType, patchBytes, metav1.PatchOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to patch PVC %s/%s annotations: %v", pvc.Namespace, pvc.Name, err)
+	}
+
+	Logc(ctx).WithFields(LogFields{
+		"pvc":         pvc.Name,
+		"namespace":   pvc.Namespace,
+		"annotations": annotations,
+	}).Info("Patched PVC annotations successfully.")
+
+	return nil
+}
+
 // RecordNodeEvent accepts the name of a CSI volume (i.e. a PV name), finds the associated
 // PVC, and posts and event message on the PVC object with the K8S API server.
 func (h *helper) RecordNodeEvent(ctx context.Context, name, eventType, reason, message string) {
@@ -963,6 +1029,196 @@ func processSCAnnotations(sc *k8sstoragev1.StorageClass) map[string]string {
 	}
 
 	return annotations
+}
+
+// buildShiftConfig resolves all information needed for the Shift integration:
+// ONTAP credentials from the TBC secret, MTV metadata from PVC annotations,
+// and the Shift endpoint from StorageClass annotations.
+func (h *helper) buildShiftConfig(
+	ctx context.Context,
+	pvc *v1.PersistentVolumeClaim,
+	scAnnotations map[string]string,
+) (*storage.ShiftConfig, error) {
+	backendRef := scAnnotations[AnnShiftTridentBackendUUID]
+	if backendRef == "" {
+		return nil, fmt.Errorf("StorageClass is missing annotation %q required for Shift integration",
+			AnnShiftTridentBackendUUID)
+	}
+
+	pvcAnn := pvc.Annotations
+	diskPath := pvcAnn[AnnMTVDiskSource]
+	nfsServer := pvcAnn[AnnMTVNFSServer]
+	nfsPath := pvcAnn[AnnMTVNFSPath]
+
+	var missing []string
+	if diskPath == "" {
+		missing = append(missing, AnnMTVDiskSource)
+	}
+	if nfsServer == "" {
+		missing = append(missing, AnnMTVNFSServer)
+	}
+	if nfsPath == "" {
+		missing = append(missing, AnnMTVNFSPath)
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("PVC %s/%s is missing required MTV annotations: %v",
+			pvc.Namespace, pvc.Name, missing)
+	}
+
+	// Resolve ONTAP connection info from the backend (accepts name or UUID)
+	mgmtLIF, svm, username, password, err := h.resolveOntapCredentials(ctx, backendRef)
+	if err != nil {
+		return nil, fmt.Errorf("unable to resolve ONTAP credentials for backend %q: %v", backendRef, err)
+	}
+
+	// Resolve Shift API credentials from the shift-credentials secret
+	shiftAPIUser, shiftAPIPass, err := h.resolveShiftAPICredentials(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("unable to resolve Shift API credentials from secret %s/%s: %v",
+			ShiftCredentialSecretNamespace, ShiftCredentialSecretName, err)
+	}
+
+	return &storage.ShiftConfig{
+		BackendUUID:     backendRef,
+		ManagementLIF:   mgmtLIF,
+		SVM:             svm,
+		Username:        username,
+		Password:        password,
+		DiskPath:        diskPath,
+		NFSServer:       nfsServer,
+		NFSPath:         nfsPath,
+		PVCUID:          string(pvc.UID),
+		PVCName:         pvc.Name,
+		ShiftAPIUsername: shiftAPIUser,
+		ShiftAPIPassword: shiftAPIPass,
+	}, nil
+}
+
+// resolveShiftAPICredentials reads the Shift API username/password from the
+// shift-credentials secret in the shift namespace.
+func (h *helper) resolveShiftAPICredentials(ctx context.Context) (string, string, error) {
+	Logc(ctx).WithFields(LogFields{
+		"secretName":      ShiftCredentialSecretName,
+		"secretNamespace": ShiftCredentialSecretNamespace,
+	}).Info("Shift: resolving API credentials from secret.")
+
+	secret, err := h.kubeClient.CoreV1().Secrets(ShiftCredentialSecretNamespace).Get(
+		ctx, ShiftCredentialSecretName, getOpts)
+	if err != nil {
+		return "", "", fmt.Errorf("cannot read secret %s/%s: %v",
+			ShiftCredentialSecretNamespace, ShiftCredentialSecretName, err)
+	}
+
+	username := string(secret.Data["username"])
+	password := string(secret.Data["password"])
+	if username == "" || password == "" {
+		return "", "", fmt.Errorf("secret %s/%s exists but is missing required key(s): username=%t, password=%t",
+			ShiftCredentialSecretNamespace, ShiftCredentialSecretName, username != "", password != "")
+	}
+
+	Logc(ctx).Info("Shift: successfully resolved API credentials from secret.")
+	return username, password, nil
+}
+
+// resolveOntapCredentials fetches the ManagementLIF and SVM from the BackendExternal,
+// then reads the ONTAP username/password from the Kubernetes Secret referenced by the TBC.
+// The backendRef may be a backend name or a backend UUID; both are tried.
+func (h *helper) resolveOntapCredentials(
+	ctx context.Context, backendRef string,
+) (mgmtLIF, svm, username, password string, err error) {
+
+	Logc(ctx).WithField("backendRef", backendRef).Debug("Shift: looking up backend by name first, then by UUID.")
+
+	backendExt, err := h.orchestrator.GetBackend(ctx, backendRef)
+	if err != nil {
+		Logc(ctx).WithField("backendRef", backendRef).Debug("Shift: GetBackend by name failed, trying GetBackendByBackendUUID.")
+		backendExt, err = h.orchestrator.GetBackendByBackendUUID(ctx, backendRef)
+		if err != nil {
+			return "", "", "", "", fmt.Errorf("backend %s not found by name or UUID: %v", backendRef, err)
+		}
+	}
+
+	Logc(ctx).WithFields(LogFields{
+		"backendName": backendExt.Name,
+		"backendUUID": backendExt.BackendUUID,
+		"configRef":   backendExt.ConfigRef,
+	}).Debug("Shift: resolved backend for credential lookup.")
+
+	// Extract non-sensitive fields (ManagementLIF, SVM) from the external config.
+	// The external config is a map[string]interface{} when JSON-round-tripped.
+	configJSON, jsonErr := json.Marshal(backendExt.Config)
+	if jsonErr != nil {
+		return "", "", "", "", fmt.Errorf("cannot marshal backend config: %v", jsonErr)
+	}
+	var parsed map[string]interface{}
+	if jsonErr = json.Unmarshal(configJSON, &parsed); jsonErr != nil {
+		return "", "", "", "", fmt.Errorf("cannot unmarshal backend config: %v", jsonErr)
+	}
+
+	if v, ok := parsed["managementLIF"].(string); ok {
+		mgmtLIF = v
+	}
+	if v, ok := parsed["svm"].(string); ok {
+		svm = v
+	}
+
+	Logc(ctx).WithFields(LogFields{
+		"managementLIF": mgmtLIF,
+		"svm":           svm,
+	}).Debug("Shift: extracted ONTAP connection info from backend config.")
+
+	// The configRef on the backend is the TBC's Kubernetes UID, not its name.
+	// List all TBCs and find the one whose UID matches.
+	configRef := backendExt.ConfigRef
+	if configRef == "" {
+		return "", "", "", "", fmt.Errorf("backend %s has no configRef (TBC)", backendRef)
+	}
+
+	tbcList, tbcErr := h.tridentClient.TridentV1().TridentBackendConfigs(h.namespace).List(ctx, listOpts)
+	if tbcErr != nil {
+		return "", "", "", "", fmt.Errorf("failed to list TBCs: %v", tbcErr)
+	}
+
+	var secretName string
+	for _, tbc := range tbcList.Items {
+		if string(tbc.UID) == configRef {
+			Logc(ctx).WithFields(LogFields{
+				"tbcName":   tbc.Name,
+				"tbcUID":    tbc.UID,
+				"configRef": configRef,
+			}).Debug("Shift: found TBC matching backend configRef.")
+
+			sName, sErr := tbc.Spec.GetSecretName()
+			if sErr != nil {
+				return "", "", "", "", fmt.Errorf("failed to get secret name from TBC %s: %v", tbc.Name, sErr)
+			}
+			secretName = sName
+			break
+		}
+	}
+
+	if secretName == "" {
+		return "", "", "", "", fmt.Errorf("no TBC found with UID %s, or TBC has no credentials secret", configRef)
+	}
+
+	Logc(ctx).WithFields(LogFields{
+		"secretName": secretName,
+		"namespace":  h.namespace,
+	}).Debug("Shift: reading credentials secret.")
+
+	secret, secretErr := h.kubeClient.CoreV1().Secrets(h.namespace).Get(ctx, secretName, getOpts)
+	if secretErr != nil {
+		return "", "", "", "", fmt.Errorf("failed to read secret %s/%s: %v", h.namespace, secretName, secretErr)
+	}
+
+	username = string(secret.Data["username"])
+	password = string(secret.Data["password"])
+	if username == "" || password == "" {
+		return "", "", "", "", fmt.Errorf("secret %s missing username or password", secretName)
+	}
+
+	Logc(ctx).Debug("Shift: successfully resolved ONTAP credentials from TBC secret.")
+	return mgmtLIF, svm, username, password, nil
 }
 
 // getSMBShareAccessControlFromPVCAnnotation parses the smbShareAccessControl annotation and updates the smbShareACL map

@@ -20,6 +20,7 @@ import (
 
 	tridentconfig "github.com/netapp/trident/config"
 	controllerhelpers "github.com/netapp/trident/frontend/csi/controller_helpers"
+	"github.com/netapp/trident/frontend/csi/shift"
 	. "github.com/netapp/trident/logging"
 	"github.com/netapp/trident/pkg/capacity"
 	"github.com/netapp/trident/pkg/collection"
@@ -237,6 +238,90 @@ func (p *Plugin) CreateVolume(
 	if err != nil {
 		p.controllerHelper.RecordVolumeEvent(ctx, req.Name, controllerhelpers.EventTypeNormal, "ProvisioningFailed", err.Error())
 		return nil, p.getCSIErrorForOrchestratorError(err)
+	}
+
+	// --- Shift integration: intercept before clone/import/create decision ---
+	// Only triggered when StorageClass has annotation shift.netapp.io/storage-class-type: "shift".
+	// Normal PVCs (without that annotation) will have volConfig.Shift == nil and skip this block entirely.
+	// If the PVC already has import annotations (Shift completed previously), skip straight to import.
+	if volConfig.Shift != nil && volConfig.ImportOriginalName == "" {
+		Logc(ctx).WithFields(LogFields{
+			"pvcName":       volConfig.RequestName,
+			"pvcNamespace":  volConfig.Namespace,
+			"pvcUID":        volConfig.Shift.PVCUID,
+			"storageClass":  volConfig.StorageClass,
+			"backendUUID":   volConfig.Shift.BackendUUID,
+			"managementLIF": volConfig.Shift.ManagementLIF,
+			"svm":           volConfig.Shift.SVM,
+			"diskPath":      volConfig.Shift.DiskPath,
+			"nfsServer":     volConfig.Shift.NFSServer,
+			"nfsPath":       volConfig.Shift.NFSPath,
+		}).Info("Shift: PVC targets a Shift StorageClass -- entering Shift flow.")
+
+		shiftResp, shiftErr := p.shiftClient.InvokeShiftJob(ctx, volConfig.Shift)
+		if shiftErr != nil {
+			msg := fmt.Sprintf("Shift API call failed for PVC %s: %v", req.Name, shiftErr)
+			Logc(ctx).Error(msg)
+			p.controllerHelper.RecordVolumeEvent(ctx, req.Name, controllerhelpers.EventTypeWarning,
+				"ShiftJobFailed", msg)
+			return nil, status.Error(codes.Internal, msg)
+		}
+
+		switch shiftResp.JobStatus() {
+		case shift.JobStatusSuccess:
+			clonedVol := shiftResp.VolumeName()
+			Logc(ctx).WithFields(LogFields{
+				"clonedVolumeName": clonedVol,
+				"id":               shiftResp.ID,
+			}).Info("Shift: VM disk conversion succeeded, patching PVC with import annotations.")
+
+			importAnnotations := map[string]string{
+				"trident.netapp.io/importOriginalName": clonedVol,
+				"trident.netapp.io/importBackendUUID":  volConfig.Shift.BackendUUID,
+				"trident.netapp.io/notManaged":        "false",
+				"trident.netapp.io/importNoRename":    "true",
+			}
+			if err := p.controllerHelper.PatchVolumeAnnotations(ctx, req.Name, importAnnotations); err != nil {
+				msg := fmt.Sprintf("Shift conversion succeeded but failed to patch PVC annotations: %v", err)
+				Logc(ctx).Error(msg)
+				return nil, status.Error(codes.Internal, msg)
+			}
+
+			p.controllerHelper.RecordVolumeEvent(ctx, req.Name, controllerhelpers.EventTypeNormal,
+				"ShiftConversionSucceeded",
+				fmt.Sprintf("NetApp Shift VM disk conversion completed; volume %s is ready for import from backend %s",
+					clonedVol, volConfig.Shift.BackendUUID))
+
+			return nil, status.Errorf(codes.Aborted,
+				"NetApp Shift conversion completed for PVC %s; retrying to trigger volume import", req.Name)
+
+		case shift.JobStatusRunning:
+			Logc(ctx).WithFields(LogFields{
+				"id":   shiftResp.ID,
+				"href": shiftResp.Href,
+			}).Info("Shift: VM disk conversion in progress, waiting for completion.")
+
+			p.controllerHelper.RecordVolumeEvent(ctx, req.Name, controllerhelpers.EventTypeNormal,
+				"ShiftConversionInProgress",
+				fmt.Sprintf("NetApp Shift VM disk conversion is in progress for PVC %s; provisioning will resume automatically once the conversion completes",
+					req.Name))
+			return nil, status.Errorf(codes.DeadlineExceeded,
+				"NetApp Shift VM disk conversion is in progress for PVC %s; provisioning will resume automatically once the conversion completes",
+				req.Name)
+
+		case shift.JobStatusFailed:
+			msg := fmt.Sprintf("NetApp Shift VM disk conversion failed for PVC %s: %s",
+				req.Name, shiftResp.Message)
+			Logc(ctx).Error(msg)
+			p.controllerHelper.RecordVolumeEvent(ctx, req.Name, controllerhelpers.EventTypeWarning,
+				"ShiftConversionFailed", msg)
+			return nil, status.Error(codes.Internal, msg)
+
+		default:
+			msg := fmt.Sprintf("NetApp Shift returned an unexpected response for PVC %s", req.Name)
+			Logc(ctx).Error(msg)
+			return nil, status.Error(codes.Internal, msg)
+		}
 	}
 
 	// Check if CSI asked for a clone (overrides trident.netapp.io/cloneFromPVC PVC annotation, if present)

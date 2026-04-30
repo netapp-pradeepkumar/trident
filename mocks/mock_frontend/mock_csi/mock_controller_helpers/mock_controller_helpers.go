@@ -197,6 +197,20 @@ func (mr *MockControllerHelperMockRecorder) RecordVolumeEvent(arg0, arg1, arg2, 
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RecordVolumeEvent", reflect.TypeOf((*MockControllerHelper)(nil).RecordVolumeEvent), arg0, arg1, arg2, arg3, arg4)
 }
 
+// PatchVolumeAnnotations mocks base method.
+func (m *MockControllerHelper) PatchVolumeAnnotations(arg0 context.Context, arg1 string, arg2 map[string]string) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "PatchVolumeAnnotations", arg0, arg1, arg2)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// PatchVolumeAnnotations indicates an expected call of PatchVolumeAnnotations.
+func (mr *MockControllerHelperMockRecorder) PatchVolumeAnnotations(arg0, arg1, arg2 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PatchVolumeAnnotations", reflect.TypeOf((*MockControllerHelper)(nil).PatchVolumeAnnotations), arg0, arg1, arg2)
+}
+
 // SupportsFeature mocks base method.
 func (m *MockControllerHelper) SupportsFeature(arg0 context.Context, arg1 controllerhelpers.Feature) bool {
 	m.ctrl.T.Helper()
